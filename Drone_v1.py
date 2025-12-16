@@ -10,21 +10,19 @@ from mavsdk import System
 from mavsdk.offboard import OffboardError, VelocityBodyYawspeed
 import aioconsole
 
-# -------- CONFIG --------
-# MAVSDK connection string (serial/UDP/etc.)
+
 MAVSDK_CONNECTION = "serial:///dev/ttyACM0:57600"
 
-# Mission / altitude settings (meters)
-CRUISE_ALT = 20.0        # mission cruise altitude
-HOLD_DESCEND_ALT = 5.0   # altitude to descend to when hold is requested
-HOLD_TIME = 10           # seconds to hold at HOLD_DESCEND_ALT
+
+CRUISE_ALT = 20.0       
+HOLD_DESCEND_ALT = 5.0 
+HOLD_TIME = 10          
 HOLD_DESCENT_SPEED = 0.7
 HOLD_ASCENT_SPEED = 0.8
 
-# How many holds before returning to base
 MAX_HOLDS_BEFORE_RTL = 5
 
-# ---------------- Helpers ----------------
+
 async def get_current_altitude(drone: System) -> float:
     """Return current relative altitude (meters)."""
     async for p in drone.telemetry.position():
@@ -32,12 +30,7 @@ async def get_current_altitude(drone: System) -> float:
     return 0.0
 
 async def go_to_altitude(drone: System, target_alt: float, speed: float = 0.7, tolerance: float = 0.3):
-    """
-    Use offboard body velocity z to go to a target relative altitude.
-    Positive velocity in VelocityBodyYawspeed's vz means down in MAVSDK (body frame),
-    so we invert the sign appropriately below.
-    """
-    # Read first sample
+
     curr_alt = await get_current_altitude(drone)
     print(f"[ALT] Current: {curr_alt:.2f} m -> Target: {target_alt:.2f} m")
 
@@ -48,28 +41,45 @@ async def go_to_altitude(drone: System, target_alt: float, speed: float = 0.7, t
             print(f"[ALT] Reached {alt:.2f} m (within {tolerance} m)")
             break
 
-        # Determine vz (m/s). In mavsdk VelocityBodyYawspeed vz > 0 moves downwards (NED), so invert sign.
-        # We want negative vz to go up (decrease altitude error) and positive vz to go down.
         vz_cmd = -speed if err > 0 else speed
         # clamp
         vz_cmd = max(min(vz_cmd, 1.5), -1.5)
         await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, vz_cmd, 0.0))
         await asyncio.sleep(0.25)
 
-    # stop vertical velocity
     await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
-    # small settle
     await asyncio.sleep(0.3)
 
-async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_ALT, hold_time: int = HOLD_TIME):
+async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_ALT, hold_time: int = HOLD_TIME, is_final_hold: bool = False):
     """
     Pause mission, enter offboard, descend to descend_alt, hold for hold_time seconds,
     ascend back to CRUISE_ALT, stop offboard, and resume mission.
     Returns True on success, False on any failure.
     """
-    print("\n" + "="*60)
-    print("[HOLD] Initiating hold sequence")
-    print("="*60)
+    if is_final_hold:
+        print(f"[FINAL] 5th hold complete and back at cruise altitude. Executing RTL...")
+        try:
+            
+            try:
+                await drone.mission.pause_mission()
+            except Exception:
+                pass
+            await drone.action.return_to_launch()
+            print("[FINAL] Return to launch commanded.")
+    
+            async for landed in drone.telemetry.landed_state():
+                if landed == drone.telemetry.LandedState.ON_GROUND:
+                    print("[FINAL] Drone landed successfully.")
+                    return True
+                await asyncio.sleep(1)
+            return True
+        except Exception as e:
+            print(f"[FINAL] RTL failed: {e}")
+            return False
+
+    print("[HOLD] Hold sequence complete.")
+    print("="*60 + "\n")
+    return True
     try:
         print("[HOLD] Pausing mission...")
         await drone.mission.pause_mission()
@@ -88,7 +98,7 @@ async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_A
         print(f"[HOLD] Offboard start unknown error: {e}")
         return False
 
-    # Descend
+   
     try:
         print(f"[HOLD] Descending to {descend_alt} m...")
         await go_to_altitude(drone, descend_alt, speed=HOLD_DESCENT_SPEED)
@@ -101,7 +111,6 @@ async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_A
             pass
         return False
 
-    # Hold at descend_alt
     try:
         print(f"[HOLD] Holding at {descend_alt} m for {hold_time} seconds...")
         await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
@@ -117,7 +126,7 @@ async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_A
             pass
         return False
 
-    # Ascend back to cruise altitude
+ 
     try:
         print(f"[HOLD] Ascending back to cruise altitude: {CRUISE_ALT} m...")
         await go_to_altitude(drone, CRUISE_ALT, speed=HOLD_ASCENT_SPEED)
@@ -130,7 +139,6 @@ async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_A
             pass
         return False
 
-    # Stop offboard and resume mission
     try:
         await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
         await drone.offboard.stop()
@@ -148,7 +156,7 @@ async def descend_hold_ascend(drone: System, descend_alt: float = HOLD_DESCEND_A
     print("="*60 + "\n")
     return True
 
-# Non-blocking single-character read (not used in async loop, kept for compatibility)
+
 def getch():
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -159,7 +167,7 @@ def getch():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
 
-# ---------------- Main mission loop ----------------
+
 async def mission_command_loop(drone: System):
     """
     Listen for ground commands (via console). Each 'h' triggers the descend/hold/ascend sequence.
@@ -175,12 +183,13 @@ async def mission_command_loop(drone: System):
         if cmd == "h":
             holds += 1
             print(f"[INFO] Hold command received ({holds}/{MAX_HOLDS_BEFORE_RTL})")
-            success = await descend_hold_ascend(drone)
+            is_final = (holds >= MAX_HOLDS_BEFORE_RTL)
+            success = await descend_hold_ascend(drone, is_final_hold=is_final)
             if not success:
                 print("[WARN] Hold sequence failed; continuing command loop.")
-            if holds >= MAX_HOLDS_BEFORE_RTL:
-                print(f"[INFO] Reached {MAX_HOLDS_BEFORE_RTL} holds. Returning to launch (base).")
-                try:
+            if is_final and success:
+                print("[INFO] RTL completed after 5th hold. Exiting command loop.")
+                break
                     # stop mission (if running) and return to launch
                     try:
                         await drone.mission.pause_mission()
@@ -220,7 +229,6 @@ async def arm_and_takeoff_to_cruise(drone: System):
     try:
         await drone.action.set_takeoff_altitude(CRUISE_ALT)
     except Exception:
-        # Some firmware versions expose set_takeoff_altitude, others may not. Ignore if not available.
         pass
 
     try:
@@ -234,7 +242,6 @@ async def arm_and_takeoff_to_cruise(drone: System):
     except Exception as e:
         print(f"[BOOT] Takeoff command failed: {e}")
 
-    # Wait until we reach cruise altitude (or timeout)
     timeout = 30
     start_t = time.time()
     while True:
@@ -247,7 +254,7 @@ async def arm_and_takeoff_to_cruise(drone: System):
             break
         await asyncio.sleep(0.5)
 
-    # Attempt to start mission (if one is uploaded)
+
     try:
         await drone.mission.start_mission()
         print("[BOOT] Mission started.")
@@ -259,13 +266,12 @@ async def main():
     print(f"[DRONE] Connecting to {MAVSDK_CONNECTION} ...")
     await drone.connect(system_address=MAVSDK_CONNECTION)
 
-    # Wait until connected
+
     async for state in drone.core.connection_state():
         if state.is_connected:
             print("[DRONE] Connected!")
             break
 
-    # Give the user a small menu: either auto-arm+takeoff+start mission, or only listen
     print("[DRONE] Ready. Starting automatic arm/takeoff to mission cruise altitude.")
     await arm_and_takeoff_to_cruise(drone)
 
@@ -276,14 +282,12 @@ async def main():
     except Exception as e:
         print(f"[MAIN] Exception in command loop: {e}")
 
-    # Final cleanup: ensure offboard is stopped if it's still running
     try:
         await drone.offboard.stop()
     except Exception:
         pass
 
     print("[MAIN] Script finished. Disconnecting.")
-    # there's no explicit disconnect call in mavsdk-python; exiting the program will close connections.
 
 if __name__ == "__main__":
     try:
